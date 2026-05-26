@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# User data — PDFs, thumbnails, merged output, project state. Keep PRIVATE, do not publish.
+projects/
+
+# gstack browser-test artifacts
+.gstack/
+
+# macOS
+.DS_Store
