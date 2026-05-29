@@ -26,6 +26,7 @@ import storage  # noqa: E402
 
 # ---------------------------------------------------------------- app state
 S = {"proj": None, "ai_status": None}  # ai_status: (ok: bool, msg: str) | None
+_drag = {"type": None, "id": None}     # in-flight drag: type=exhibit|packet
 
 storage.PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 app.add_static_files("/pdfdata", str(storage.PROJECTS_DIR))
@@ -83,6 +84,68 @@ def rename_packet(packet_id, value):
         return
     pkt["name"] = (value or pkt["name"]).strip()
     save()
+
+
+def move_packet(packet_id, delta):
+    """Reorder a packet up/down within its tab (delta = -1 or +1)."""
+    proj = S["proj"]
+    tab, pkt = storage.find_packet(proj, packet_id)
+    if pkt is None:
+        return
+    i = tab["packets"].index(pkt)
+    j = max(0, min(len(tab["packets"]) - 1, i + delta))
+    if i == j:
+        return
+    tab["packets"].pop(i)
+    tab["packets"].insert(j, pkt)
+    save()
+    view.refresh()
+
+
+def set_drag_exhibit(exhibit_id):
+    _drag["type"], _drag["id"] = "exhibit", exhibit_id
+
+
+def drop_on_exhibit(target_exhibit_id):
+    """Drop an exhibit before the target exhibit."""
+    if _drag["type"] != "exhibit" or _drag["id"] is None:
+        _drag["id"] = None
+        return
+    proj = S["proj"]
+    eid = _drag["id"]
+    src_tab, src_pkt, src_ex = storage.find_exhibit(proj, eid)
+    dst_tab, dst_pkt, dst_ex = storage.find_exhibit(proj, target_exhibit_id)
+    if src_ex is None or dst_ex is None or src_ex is dst_ex:
+        _drag["id"] = None
+        return
+    src_idx = src_pkt["exhibits"].index(src_ex)
+    src_pkt["exhibits"].pop(src_idx)
+    dst_idx = dst_pkt["exhibits"].index(dst_ex)
+    if src_pkt is dst_pkt and src_idx < dst_idx:
+        dst_idx -= 1
+    dst_pkt["exhibits"].insert(dst_idx, src_ex)
+    _drag["id"] = None
+    save()
+    view.refresh()
+
+
+def drop_on_packet(target_packet_id):
+    """Drop an exhibit into a packet (append)."""
+    if _drag["type"] != "exhibit" or _drag["id"] is None:
+        _drag["id"] = None
+        return
+    proj = S["proj"]
+    eid = _drag["id"]
+    src_tab, src_pkt, src_ex = storage.find_exhibit(proj, eid)
+    dst_tab, dst_pkt = storage.find_packet(proj, target_packet_id)
+    if src_ex is None or dst_pkt is None:
+        _drag["id"] = None
+        return
+    src_pkt["exhibits"].remove(src_ex)
+    dst_pkt["exhibits"].append(src_ex)
+    _drag["id"] = None
+    save()
+    view.refresh()
 
 
 def delete_exhibit(exhibit_id):
@@ -328,12 +391,116 @@ def view():
         for tab in proj["tabs"]:
             render_tab(tab)
 
-    # ---------- VISUAL PREVIEW placeholder
-    with ui.column().classes("w-full px-6 pb-10 gap-2"):
-        ui.label("VISUAL PREVIEW").classes("text-xs font-bold text-gray-400 tracking-widest pt-4")
-        ui.label("Page thumbnails appear here after you upload exhibits. (Read-only — reorder from the TOC above.)").classes(
-            "text-sm text-gray-500 italic"
+    # ---------- VISUAL PREVIEW (read-only, mirrors TOC order)
+    with ui.column().classes("w-full px-6 pt-6 pb-2 gap-2"):
+        ui.label("VISUAL PREVIEW").classes("text-xs font-bold text-gray-400 tracking-widest")
+        ui.label("Read-only — reorder from the TOC above.").classes("text-xs text-gray-500")
+    with ui.column().classes("w-full px-6 pb-10 gap-3"):
+        numbering = exhibit_numbering(proj)
+        any_exhibits = bool(numbering)
+        if not any_exhibits:
+            ui.label("(no exhibits yet)").classes("text-sm text-gray-400 italic")
+        for tab in proj["tabs"]:
+            tab_has = any(p["exhibits"] for p in tab["packets"])
+            if not tab_has:
+                continue
+            render_visual_tab(tab, numbering)
+
+
+def render_visual_tab(tab, numbering):
+    with ui.column().classes("w-full bg-gray-50 rounded-xl p-3 gap-2"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.label(tab["letter"]).classes("text-lg font-bold text-gray-500 w-6")
+            ui.label(tab["name"]).classes("font-semibold text-black")
+        with ui.row().classes("w-full flex-nowrap overflow-x-auto items-start gap-3 pb-2"):
+            for pkt in tab["packets"]:
+                if not pkt["exhibits"]:
+                    continue
+                render_visual_packet(pkt, numbering)
+
+
+def render_visual_packet(pkt, numbering):
+    proj = S["proj"]
+    with ui.column().classes("shrink-0 bg-white rounded border border-gray-200 p-2 gap-2").style("width:200px;"):
+        with ui.row().classes("w-full items-center gap-2 text-xs text-gray-500"):
+            ui.label(pkt["name"]).classes("font-semibold text-black")
+            ui.label(f"{len(pkt['exhibits'])} ex").classes("text-[10px]")
+        with ui.column().classes("w-full gap-1 max-h-[60vh] overflow-y-auto"):
+            for ex in pkt["exhibits"]:
+                render_visual_exhibit(ex, numbering.get(ex["id"], "?"))
+
+
+def render_visual_exhibit(ex, exhibit_number):
+    proj = S["proj"]
+    src = proj["sources"].get(ex["src_id"], {})
+    card = ui.card().classes(
+        "relative p-0 overflow-hidden cursor-pointer bg-gray-50 rounded shadow-sm "
+        "hover:shadow-md hover:ring-2 hover:ring-gray-400 transition w-full"
+    )
+    card.on("click", lambda _e, eid=ex["id"]: open_exhibit_preview(eid))
+    card.tooltip(f"Ex {exhibit_number} · {ex.get('title', '')}")
+    with card:
+        ui.html(
+            f'<img src="/pdfdata/{proj["slug"]}/thumbs/{ex["src_id"]}-0.png" '
+            f'style="display:block;width:100%;height:auto;background:#fff;" />',
+            sanitize=False,
         )
+        ui.label(f"Ex {exhibit_number}").classes(
+            "absolute top-0 left-0 bg-black text-white text-[10px] font-bold leading-none px-1.5 py-1 rounded-br"
+        )
+        ui.label(ex.get("title", "")).classes(
+            "absolute bottom-0 left-0 right-0 bg-black/70 text-white text-[10px] leading-tight "
+            "px-1 py-0.5 truncate"
+        )
+
+
+def open_exhibit_preview(exhibit_id):
+    """Lightbox — full-page preview of all pages of an exhibit. Read-only."""
+    proj = S["proj"]
+    _t, _p, ex = storage.find_exhibit(proj, exhibit_id)
+    if ex is None:
+        return
+    pages = proj["sources"].get(ex["src_id"], {}).get("page_count", 1)
+    numbering = exhibit_numbering(proj)
+    n = numbering.get(exhibit_id, "?")
+    st = {"page": 0}
+
+    def preview_url(p):
+        path = storage.preview_dir(proj["slug"]) / f"{ex['src_id']}-{p}.png"
+        if not path.exists():
+            pdf_engine.render_preview(
+                storage.source_dir(proj["slug"]) / f"{ex['src_id']}.pdf", p, path
+            )
+        return f"/pdfdata/{proj['slug']}/preview/{ex['src_id']}-{p}.png"
+
+    with ui.dialog().props("maximized") as dialog, ui.card().classes(
+        "bg-black text-white w-full h-full p-0 gap-0 items-stretch"
+    ):
+        with ui.row().classes("w-full items-center no-wrap gap-2 px-4 py-2 bg-black"):
+            cap = ui.label().classes("text-sm truncate grow")
+            ui.button(icon="close", on_click=dialog.close).props("flat round dense color=white")
+        with ui.row().classes("w-full grow items-center justify-center overflow-auto bg-black"):
+            @ui.refreshable
+            def big():
+                ui.html(
+                    f'<img src="{preview_url(st["page"])}" style="max-height:82vh;max-width:94vw;'
+                    f'object-fit:contain;display:block;margin:auto;border-radius:4px;" />',
+                    sanitize=False,
+                )
+            big()
+
+        def update_cap():
+            cap.text = f"Ex {n} · {ex.get('title','')} · page {st['page']+1} / {pages}"
+
+        def go(delta):
+            st["page"] = max(0, min(pages - 1, st["page"] + delta))
+            big.refresh(); update_cap()
+
+        with ui.row().classes("w-full justify-center gap-6 py-2 bg-black"):
+            ui.button("Prev", icon="chevron_left", on_click=lambda: go(-1)).props("flat color=white")
+            ui.button("Next", icon="chevron_right", on_click=lambda: go(1)).props("flat color=white")
+        update_cap()
+    dialog.open()
 
 
 def render_tab(tab):
@@ -355,7 +522,13 @@ def render_tab(tab):
 
 
 def render_packet(tab, pkt):
-    with ui.column().classes("w-full bg-white rounded border border-gray-200 p-3 gap-2"):
+    pkt_idx = tab["packets"].index(pkt)
+    last_idx = len(tab["packets"]) - 1
+    col = ui.column().classes("w-full bg-white rounded border border-gray-200 p-3 gap-2")
+    # drop target for exhibit moves
+    col.on("dragover.prevent", lambda: None)
+    col.on("drop", lambda _e, pid=pkt["id"]: drop_on_packet(pid))
+    with col:
         with ui.row().classes("w-full items-center no-wrap gap-2"):
             ui.input(value=pkt["name"], on_change=lambda e, pid=pkt["id"]: rename_packet(pid, e.value)).props(
                 "borderless dense"
@@ -364,6 +537,14 @@ def render_packet(tab, pkt):
                 "text-xs text-gray-500"
             )
             ui.space()
+            ui.button(icon="arrow_upward",
+                      on_click=lambda _e, pid=pkt["id"]: move_packet(pid, -1)).props(
+                f"flat round dense size=sm color=dark{' disable' if pkt_idx == 0 else ''}"
+            ).tooltip("Move packet up")
+            ui.button(icon="arrow_downward",
+                      on_click=lambda _e, pid=pkt["id"]: move_packet(pid, 1)).props(
+                f"flat round dense size=sm color=dark{' disable' if pkt_idx == last_idx else ''}"
+            ).tooltip("Move packet down")
             ui.button(icon="delete", on_click=lambda _e, pid=pkt["id"]: delete_packet(pid)).props(
                 "flat round dense size=sm color=red"
             ).tooltip("Delete this packet")
@@ -384,10 +565,15 @@ def exhibit_numbering(proj):
 
 def render_exhibit_row(ex, exhibit_number):
     src = S["proj"]["sources"].get(ex["src_id"], {})
-    with ui.row().classes(
-        "w-full items-center gap-2 text-sm text-gray-700 p-2 rounded hover:bg-gray-50"
-    ):
-        ui.icon("drag_indicator").classes("text-gray-300 cursor-grab")
+    row = ui.row().classes(
+        "w-full items-center gap-2 text-sm text-gray-700 p-2 rounded hover:bg-gray-50 cursor-grab"
+    )
+    row.props("draggable")
+    row.on("dragstart", lambda _e, eid=ex["id"]: set_drag_exhibit(eid))
+    row.on("dragover.prevent", lambda: None)
+    row.on("drop.stop", lambda _e, eid=ex["id"]: drop_on_exhibit(eid))
+    with row:
+        ui.icon("drag_indicator").classes("text-gray-300")
         ui.label(f"Ex {exhibit_number}").classes("font-mono text-xs text-gray-500 w-12")
         ui.icon("article").classes("text-gray-500")
         with ui.column().classes("grow gap-0 min-w-0"):
