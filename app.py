@@ -543,6 +543,9 @@ def view():
                 value=proj.get("petitioner", ""), on_change=lambda e: set_petitioner(e.value)
             ).props("dense outlined").classes("min-w-56")
 
+    # ---------- compliance summary
+    render_compliance_summary(proj)
+
     # ---------- TABLE OF CONTENTS
     with ui.column().classes("w-full px-6 pt-6 pb-2 gap-2"):
         ui.label("TABLE OF CONTENTS").classes("text-xs font-bold text-gray-400 tracking-widest")
@@ -677,6 +680,34 @@ def open_exhibit_preview(exhibit_id):
             ui.button("Next", icon="chevron_right", on_click=lambda: go(1)).props("flat color=white")
         update_cap()
     dialog.open()
+
+
+def render_compliance_summary(proj):
+    total_ex = sum(len(p["exhibits"]) for t in proj["tabs"] for p in t["packets"])
+    used_pkts = [p for t in proj["tabs"] for p in t["packets"] if p["exhibits"]]
+    total_pkt = len(used_pkts)
+    total_size = sum(s for s in S["sizes"].values() if isinstance(s, int) and s > 0)
+    empty_tabs = [t["letter"] for t in proj["tabs"] if not any(p["exhibits"] for p in t["packets"])]
+    limit = section_limit_bytes(proj)
+    over = [p["name"] for t in proj["tabs"] for p in t["packets"] if (S["sizes"].get(p["id"]) or 0) > limit]
+
+    def stat(label, value, color="text-black"):
+        with ui.column().classes("gap-0 shrink-0"):
+            ui.label(label).classes("text-[10px] uppercase tracking-wider text-gray-400")
+            ui.label(str(value)).classes(f"font-semibold {color}")
+
+    with ui.column().classes("w-full px-6 pt-4"):
+        with ui.card().classes("w-full p-3 bg-gray-50 border border-gray-200"):
+            with ui.row().classes("w-full gap-8 items-center no-wrap"):
+                stat("Exhibits", total_ex)
+                stat("Packets", total_pkt)
+                stat("Total size", hsize(total_size) if total_size else "—")
+                stat("Empty tabs", ", ".join(empty_tabs) or "—")
+                stat(
+                    "Over 12MB",
+                    ", ".join(over) if over else "none",
+                    color="text-red-600" if over else "text-emerald-600",
+                )
 
 
 def render_tab(tab):
@@ -819,7 +850,31 @@ def edit_exhibit_dialog(exhibit_id):
         cover_in = ui.textarea("Cover-sheet paragraph", value=ex.get("cover_paragraph", "")).props(
             "autogrow"
         ).classes("w-full")
+
+        async def regen():
+            if not ai.have_key():
+                ui.notify("No API key — set ANTHROPIC_API_KEY in .env", type="warning")
+                return
+            ui.notify("Regenerating with AI…", type="info")
+            pdf_path = storage.source_dir(proj["slug"]) / f"{ex['src_id']}.pdf"
+            text, _ = await asyncio.to_thread(ocr.extract_or_ocr, pdf_path)
+            if not text:
+                ui.notify("No text extracted from source PDF", type="warning")
+                return
+            try:
+                result = await asyncio.to_thread(
+                    ai.classify_document, text, ex.get("title", "") + ".pdf"
+                )
+                title_in.value = result["title"]
+                cover_in.value = result["cover_paragraph"]
+                ui.notify("AI regenerated — review and save", type="positive")
+            except Exception as ex2:
+                ui.notify(f"AI failed: {ex2}", type="negative")
+
         with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Regenerate with AI", icon="auto_awesome", on_click=regen).props(
+                "flat color=dark"
+            ).tooltip("Re-run Claude on the source PDF to redraft the title + cover paragraph")
             ui.button("Cancel", on_click=d.close).props("flat")
             ui.button(
                 "Save",
