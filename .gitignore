@@ -3,6 +3,9 @@
 __pycache__/
 *.pyc
 
+# Anthropic API key — NEVER commit
+.env
+
 # User data — PDFs, thumbnails, merged output, project state. Keep PRIVATE, do not publish.
 projects/
 

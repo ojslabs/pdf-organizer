@@ -1,22 +1,44 @@
-"""Project persistence: one folder per project, JSON state, auto-saved on every change.
+"""NIW Petition Builder v2 — persistence.
 
-Layout:
-  projects/<slug>/project.json     state (packets, page order, sources)
-  projects/<slug>/source/*.pdf     copies of uploaded PDFs
-  projects/<slug>/thumbs/*.png     cached page thumbnails (<src>-<page>.png)
-  projects/<slug>/output/*.pdf     merged results
+Project layout:
+  projects/<slug>/
+    project.json     state (tabs, packets, exhibits, sources, petitioner)
+    source/*.pdf     copies of uploaded PDFs (one per source document)
+    thumbs/*.png     per-page thumbnails
+    preview/*.png    large preview images (lazy-rendered)
+    output/*.pdf     merged packet files + master index
+
+Schema:
+{
+  "name":       project display name,
+  "slug":       folder slug,
+  "petitioner": petitioner full name (printed on cover sheets / master index),
+  "size_limit_mb": 12,
+  "sources":    { src_id: {filename, page_count, bytes} },
+  "tabs":       [ { id, letter, key, name, hint,
+                    packets: [ { id, name,
+                                 exhibits: [ {id, src_id, title, summary,
+                                              cover_paragraph,
+                                              ai_meta:{suggested_tab,...}} ] } ] } ]
+}
+
+Migrates v1 niw projects (sections schema) and pre-niw projects (packets schema) by
+landing every existing source as a placeholder exhibit in tab A packet A1; the user
+can drag them to the right tab via the TOC.
 """
 import json
 import re
 import uuid
 from pathlib import Path
 
+import niw_template
+
 PROJECTS_DIR = Path(__file__).parent / "projects"
 
 
 def slugify(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9_-]+", "-", name.strip()).strip("-").lower()
-    return s or "project"
+    return s or "petition"
 
 
 def new_id() -> str:
@@ -44,7 +66,6 @@ def output_dir(slug: str) -> Path:
 
 
 def list_projects():
-    """Return [(slug, display_name), ...] sorted by name."""
     if not PROJECTS_DIR.exists():
         return []
     out = []
@@ -66,23 +87,120 @@ def _unique_slug(base: str) -> str:
     return slug
 
 
-def new_project(name: str) -> dict:
+def new_project(name: str, petitioner: str = "") -> dict:
     slug = _unique_slug(slugify(name))
     proj = {
         "name": name,
         "slug": slug,
-        "sources": {},  # src_id -> {filename, page_count, bytes}
-        "packets": [{"id": new_id(), "name": "Packet 1", "pages": []}],
+        "petitioner": petitioner or name,
+        "size_limit_mb": 12,
+        "sources": {},
+        "tabs": niw_template.new_tabs(),
     }
     save(proj)
     return proj
 
 
 def load(slug: str) -> dict:
-    return json.loads((project_dir(slug) / "project.json").read_text())
+    proj = json.loads((project_dir(slug) / "project.json").read_text())
+    proj = _migrate_if_needed(proj)
+    return proj
 
 
 def save(proj: dict) -> None:
     d = project_dir(proj["slug"])
     d.mkdir(parents=True, exist_ok=True)
     (d / "project.json").write_text(json.dumps(proj, indent=2))
+
+
+# ---------------------------------------------------------------- migration
+def _migrate_if_needed(proj: dict) -> dict:
+    """Handle two earlier schemas: v1 niw `sections` and pre-niw `packets`."""
+    if "tabs" in proj and "sections" not in proj and "packets" not in proj:
+        proj.setdefault("petitioner", proj.get("name", ""))
+        proj.setdefault("size_limit_mb", 12)
+        return proj
+
+    new = {
+        "name": proj.get("name", "Untitled Petition"),
+        "slug": proj["slug"],
+        "petitioner": proj.get("petitioner") or proj.get("name", ""),
+        "size_limit_mb": proj.get("size_limit_mb", 12),
+        "sources": proj.get("sources", {}),
+        "tabs": niw_template.new_tabs(),
+    }
+
+    # land every prior source as a placeholder exhibit in A1 (user drags to right tab)
+    a_pkt = new["tabs"][0]["packets"][0]
+    seen = set()
+
+    if "sections" in proj:  # v1 niw schema
+        for sec in proj["sections"]:
+            for slot in sec["slots"]:
+                for ex in slot["exhibits"]:
+                    sid = ex["src_id"]
+                    if sid in seen:
+                        continue
+                    seen.add(sid)
+                    a_pkt["exhibits"].append(
+                        {
+                            "id": new_id(),
+                            "src_id": sid,
+                            "title": ex.get("label") or new["sources"].get(sid, {}).get("filename", "Document"),
+                            "summary": "",
+                            "cover_paragraph": ex.get("rationale", ""),
+                            "ai_meta": {},
+                        }
+                    )
+    elif "packets" in proj:  # pre-niw schema
+        for pk in proj["packets"]:
+            for pg in pk.get("pages", []):
+                sid = pg["src"]
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                a_pkt["exhibits"].append(
+                    {
+                        "id": new_id(),
+                        "src_id": sid,
+                        "title": new["sources"].get(sid, {}).get("filename", "Document").removesuffix(".pdf"),
+                        "summary": "",
+                        "cover_paragraph": "",
+                        "ai_meta": {},
+                    }
+                )
+
+    save(new)
+    return new
+
+
+# ---------------------------------------------------------------- helpers
+def find_tab(proj, tab_id):
+    return next((t for t in proj["tabs"] if t["id"] == tab_id), None)
+
+
+def find_packet(proj, packet_id):
+    for t in proj["tabs"]:
+        for p in t["packets"]:
+            if p["id"] == packet_id:
+                return t, p
+    return None, None
+
+
+def find_exhibit(proj, exhibit_id):
+    for t in proj["tabs"]:
+        for p in t["packets"]:
+            for ex in p["exhibits"]:
+                if ex["id"] == exhibit_id:
+                    return t, p, ex
+    return None, None, None
+
+
+def iter_exhibits(proj):
+    """Yield (tab, packet, exhibit, exhibit_number) in petition order."""
+    n = 0
+    for t in proj["tabs"]:
+        for p in t["packets"]:
+            for ex in p["exhibits"]:
+                n += 1
+                yield t, p, ex, n
