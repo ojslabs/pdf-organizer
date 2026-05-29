@@ -1,7 +1,13 @@
-"""PyMuPDF wrapper: render page thumbnails + merge selected pages into one PDF."""
+"""PyMuPDF wrapper: render page thumbnails, build per-packet merged PDFs with
+exhibit cover sheets prepended, generate the master exhibit index, and measure
+exact merged byte size for the 12MB-per-file governor.
+"""
+import tempfile
 from pathlib import Path
 
 import fitz  # PyMuPDF
+
+import cover_sheet
 
 THUMB_WIDTH = 220  # px wide; capped for speed + small cache
 
@@ -37,18 +43,74 @@ def render_preview(source_pdf: Path, page: int, out_path: Path, width: int = 110
     return out_path
 
 
-def merge_packet(pages, source_dir: Path, out_path: Path) -> int:
-    """Assemble an ordered list of {src, page} into one PDF. Returns output byte size."""
+def build_packet_pdf(
+    petitioner: str,
+    tab_name: str,
+    exhibits_numbered,
+    source_dir: Path,
+    target: Path,
+) -> int:
+    """Build one packet's merged PDF: cover-sheet + exhibit per exhibit in order.
+
+    exhibits_numbered: ordered iterable of (exhibit_dict, exhibit_number).
+    Returns output file size in bytes.
+    """
     out = fitz.open()
-    cache = {}
-    for pg in pages:
-        sid = pg["src"]
+    cache: dict = {}
+    for ex, n in exhibits_numbered:
+        cover = cover_sheet.make_cover_sheet(
+            exhibit_number=n,
+            tab_name=tab_name,
+            exhibit_title=ex.get("title") or "(untitled)",
+            cover_paragraph=ex.get("cover_paragraph") or "",
+            petitioner_name=petitioner,
+        )
+        out.insert_pdf(cover)
+        cover.close()
+        sid = ex["src_id"]
         if sid not in cache:
             cache[sid] = fitz.open(source_dir / f"{sid}.pdf")
-        out.insert_pdf(cache[sid], from_page=pg["page"], to_page=pg["page"])
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out.save(out_path, garbage=4, deflate=True)
+        out.insert_pdf(cache[sid])
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    out.save(target, garbage=4, deflate=True)
     out.close()
     for d in cache.values():
         d.close()
-    return out_path.stat().st_size
+    return target.stat().st_size
+
+
+def measure_packet_size(
+    petitioner: str,
+    tab_name: str,
+    exhibits_numbered,
+    source_dir: Path,
+) -> int:
+    """Build packet to a temp file just to measure exact bytes. Returns size."""
+    exhibits_numbered = list(exhibits_numbered)
+    if not exhibits_numbered:
+        return 0
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        return build_packet_pdf(
+            petitioner, tab_name, exhibits_numbered, source_dir, tmp_path
+        )
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def build_master_index(petitioner: str, entries, target: Path) -> int:
+    doc = cover_sheet.make_master_index(petitioner_name=petitioner, entries=entries)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(target, garbage=4, deflate=True)
+    doc.close()
+    return target.stat().st_size
+
+
+def exhibit_page_count(source_pdf: Path) -> int:
+    with fitz.open(source_pdf) as d:
+        return d.page_count

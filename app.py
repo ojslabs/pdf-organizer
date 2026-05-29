@@ -25,7 +25,11 @@ import storage  # noqa: E402
 
 
 # ---------------------------------------------------------------- app state
-S = {"proj": None, "ai_status": None}  # ai_status: (ok: bool, msg: str) | None
+S = {
+    "proj": None,
+    "ai_status": None,    # (ok: bool, msg: str) | None
+    "sizes": {},          # packet_id -> bytes | None (computing) | -1 (empty)
+}
 _drag = {"type": None, "id": None}     # in-flight drag: type=exhibit|packet
 
 storage.PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,7 +53,76 @@ def set_petitioner(value):
 
 def switch_project(slug):
     S["proj"] = storage.load(slug)
+    S["sizes"] = {}
+    schedule_all_recompute()
     view.refresh()
+
+
+# ---------------------------------------------------------------- helpers
+def hsize(n) -> str:
+    if n is None:
+        return "—"
+    if n < 0:
+        return "empty"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def section_limit_bytes(proj) -> int:
+    return int(proj.get("size_limit_mb", 12)) * 1024 * 1024
+
+
+def exhibits_numbered_in_packet(proj, packet):
+    """Return [(exhibit_dict, exhibit_number), ...] in TOC order."""
+    numbering = exhibit_numbering(proj)
+    return [(ex, numbering[ex["id"]]) for ex in packet["exhibits"]]
+
+
+# ---------------------------------------------------------------- background sizing
+def _measure_packet_blocking(packet_id):
+    proj = S["proj"]
+    tab, pkt = storage.find_packet(proj, packet_id)
+    if pkt is None:
+        return 0
+    items = exhibits_numbered_in_packet(proj, pkt)
+    if not items:
+        return -1
+    return pdf_engine.measure_packet_size(
+        proj.get("petitioner", ""),
+        tab["name"],
+        items,
+        storage.source_dir(proj["slug"]),
+    )
+
+
+async def recompute_packet_size(packet_id):
+    S["sizes"][packet_id] = None
+    view.refresh()
+    try:
+        sz = await asyncio.to_thread(_measure_packet_blocking, packet_id)
+        S["sizes"][packet_id] = sz
+    except Exception as e:
+        S["sizes"][packet_id] = -1
+        ui.notify(f"Size compute failed: {e}", type="negative")
+    view.refresh()
+
+
+def schedule_packet_recompute(packet_id):
+    from nicegui import background_tasks
+    background_tasks.create(recompute_packet_size(packet_id))
+
+
+def schedule_all_recompute():
+    proj = S.get("proj")
+    if proj is None:
+        return
+    for tab in proj["tabs"]:
+        for pkt in tab["packets"]:
+            schedule_packet_recompute(pkt["id"])
 
 
 # ---------------------------------------------------------------- mutations
@@ -126,6 +199,9 @@ def drop_on_exhibit(target_exhibit_id):
     dst_pkt["exhibits"].insert(dst_idx, src_ex)
     _drag["id"] = None
     save()
+    schedule_packet_recompute(src_pkt["id"])
+    if dst_pkt["id"] != src_pkt["id"]:
+        schedule_packet_recompute(dst_pkt["id"])
     view.refresh()
 
 
@@ -145,6 +221,9 @@ def drop_on_packet(target_packet_id):
     dst_pkt["exhibits"].append(src_ex)
     _drag["id"] = None
     save()
+    schedule_packet_recompute(src_pkt["id"])
+    if dst_pkt["id"] != src_pkt["id"]:
+        schedule_packet_recompute(dst_pkt["id"])
     view.refresh()
 
 
@@ -166,6 +245,95 @@ def delete_exhibit(exhibit_id):
             for f in d.glob(f"{sid}-*.png"):
                 f.unlink(missing_ok=True)
     save()
+    schedule_packet_recompute(pkt["id"])
+    view.refresh()
+
+
+# ---------------------------------------------------------------- merge / export
+def packet_output_name(tab, pkt) -> str:
+    return f"{pkt['name']}_{storage.slugify(tab['name'])}.pdf"
+
+
+def merge_packet(packet_id):
+    proj = S["proj"]
+    tab, pkt = storage.find_packet(proj, packet_id)
+    if pkt is None or not pkt["exhibits"]:
+        ui.notify("Packet is empty.", type="warning")
+        return
+    fname = packet_output_name(tab, pkt)
+    target = storage.output_dir(proj["slug"]) / fname
+    items = exhibits_numbered_in_packet(proj, pkt)
+    size = pdf_engine.build_packet_pdf(
+        proj.get("petitioner", ""), tab["name"], items,
+        storage.source_dir(proj["slug"]), target,
+    )
+    S["sizes"][packet_id] = size
+    limit = section_limit_bytes(proj)
+    if size > limit:
+        ui.notify(f"Merged {fname} → {hsize(size)} — OVER 12MB.", type="warning")
+    else:
+        ui.notify(f"Merged {fname} → {hsize(size)}", type="positive")
+    ui.download(f"/pdfdata/{proj['slug']}/output/{fname}")
+    view.refresh()
+
+
+def build_master_index():
+    proj = S["proj"]
+    numbering = exhibit_numbering(proj)
+    if not numbering:
+        ui.notify("No exhibits yet.", type="warning")
+        return
+    entries = []
+    for tab in proj["tabs"]:
+        for pkt in tab["packets"]:
+            fname = packet_output_name(tab, pkt)
+            page = 1
+            for ex in pkt["exhibits"]:
+                entries.append(
+                    {
+                        "number": numbering[ex["id"]],
+                        "title": ex.get("title") or "(untitled)",
+                        "tab": f"{tab['letter']} — {tab['name']}",
+                        "output_file": fname,
+                        "page": page,
+                    }
+                )
+                src_path = storage.source_dir(proj["slug"]) / f"{ex['src_id']}.pdf"
+                page += 1 + pdf_engine.exhibit_page_count(src_path)
+    target = storage.output_dir(proj["slug"]) / "00_Master_Index.pdf"
+    pdf_engine.build_master_index(proj.get("petitioner", ""), entries, target)
+    ui.notify(f"Master Index → 00_Master_Index.pdf ({len(entries)} exhibits)", type="positive")
+    ui.download(f"/pdfdata/{proj['slug']}/output/00_Master_Index.pdf")
+
+
+def export_all():
+    proj = S["proj"]
+    numbering = exhibit_numbering(proj)
+    if not numbering:
+        ui.notify("No exhibits yet — nothing to export.", type="warning")
+        return
+    built, over = [], []
+    for tab in proj["tabs"]:
+        for pkt in tab["packets"]:
+            if not pkt["exhibits"]:
+                continue
+            fname = packet_output_name(tab, pkt)
+            target = storage.output_dir(proj["slug"]) / fname
+            items = exhibits_numbered_in_packet(proj, pkt)
+            size = pdf_engine.build_packet_pdf(
+                proj.get("petitioner", ""), tab["name"], items,
+                storage.source_dir(proj["slug"]), target,
+            )
+            S["sizes"][pkt["id"]] = size
+            built.append((fname, size))
+            if size > section_limit_bytes(proj):
+                over.append(fname)
+    build_master_index()
+    msg = f"Exported {len(built)} files to projects/{proj['slug']}/output/."
+    if over:
+        ui.notify(msg + f" ⚠ Over 12MB: {', '.join(over)}", type="warning")
+    else:
+        ui.notify(msg, type="positive")
     view.refresh()
 
 
@@ -277,6 +445,7 @@ def open_review_dialog(src_id, filename, page_count, result, used_ocr, ai_error,
             )
             save()
             dialog.close()
+            schedule_packet_recompute(target_pkt["id"])
             view.refresh()
             ui.notify(f"Added {filename} to {target_tab['letter']}", type="positive")
 
@@ -342,6 +511,13 @@ def view():
         ).tooltip("New petition")
 
         ui.space()
+
+        ui.button("Master Index", icon="list_alt", on_click=build_master_index).props(
+            "color=dark dense"
+        ).tooltip("Generate the master exhibit index PDF")
+        ui.button("Export All", icon="folder_zip", on_click=export_all).props(
+            "color=dark dense"
+        ).tooltip("Build all packet PDFs + master index")
 
         # API status badge
         status = S.get("ai_status")
@@ -524,8 +700,28 @@ def render_tab(tab):
 def render_packet(tab, pkt):
     pkt_idx = tab["packets"].index(pkt)
     last_idx = len(tab["packets"]) - 1
+    proj = S["proj"]
+    size = S["sizes"].get(pkt["id"])
+    limit = section_limit_bytes(proj)
+    limit_mb = proj.get("size_limit_mb", 12)
+
+    if size is None:
+        bar_color, bar_text, bar_pct = "bg-gray-300", "computing…", 0
+    elif size < 0 or size == 0:
+        bar_color, bar_text, bar_pct = "bg-gray-200", "empty", 0
+    else:
+        bar_pct = min(100, size * 100 / limit) if limit else 0
+        if size > limit:
+            bar_color = "bg-red-500"
+            bar_text = f"{hsize(size)} / {limit_mb} MB ⚠"
+        elif bar_pct >= 90:
+            bar_color = "bg-amber-400"
+            bar_text = f"{hsize(size)} / {limit_mb} MB"
+        else:
+            bar_color = "bg-emerald-500"
+            bar_text = f"{hsize(size)} / {limit_mb} MB"
+
     col = ui.column().classes("w-full bg-white rounded border border-gray-200 p-3 gap-2")
-    # drop target for exhibit moves
     col.on("dragover.prevent", lambda: None)
     col.on("drop", lambda _e, pid=pkt["id"]: drop_on_packet(pid))
     with col:
@@ -537,6 +733,14 @@ def render_packet(tab, pkt):
                 "text-xs text-gray-500"
             )
             ui.space()
+            # size bar
+            with ui.column().classes("w-44 gap-1 shrink-0"):
+                ui.label(bar_text).classes("text-[11px] text-gray-600 text-right")
+                with ui.element("div").classes("w-full h-2 bg-gray-200 rounded overflow-hidden"):
+                    ui.element("div").classes(f"h-full {bar_color}").style(f"width:{bar_pct}%;")
+            ui.button(icon="merge", on_click=lambda _e, pid=pkt["id"]: merge_packet(pid)).props(
+                "flat round dense size=sm color=dark"
+            ).tooltip("Merge this packet → PDF")
             ui.button(icon="arrow_upward",
                       on_click=lambda _e, pid=pkt["id"]: move_packet(pid, -1)).props(
                 f"flat round dense size=sm color=dark{' disable' if pkt_idx == 0 else ''}"
@@ -635,6 +839,9 @@ def _save_exhibit_edits(exhibit_id, title, cover):
     ex["title"] = (title or ex["title"]).strip() or "Untitled"
     ex["cover_paragraph"] = (cover or "").strip()
     save()
+    _t, pkt, _e = storage.find_exhibit(S["proj"], exhibit_id)
+    if pkt is not None:
+        schedule_packet_recompute(pkt["id"])
     view.refresh()
 
 
@@ -646,10 +853,12 @@ def init():
     else:
         S["proj"] = storage.new_project("Untitled NIW Petition", "")
     S["ai_status"] = None
+    S["sizes"] = {}
     view()
-    # check Anthropic in background so UI doesn't block
+    # check Anthropic + measure all packet sizes in background
     from nicegui import background_tasks
     background_tasks.create(refresh_api_status())
+    schedule_all_recompute()
 
 
 @ui.page("/")
